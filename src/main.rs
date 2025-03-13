@@ -111,6 +111,15 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
 					continue;
 				}
 			};
+	
+			match payload {
+				MessagePayload::Join { room } => {
+					add_peer(&state, (room.clone(), who), tx_clone()).await;
+					joined_rooms.insert(room.clone());
+					println!("{who} joined room {room}");
+				}
+				_ => (),
+			}
 		}
 
 		for room in joined_rooms {
@@ -149,4 +158,9 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
 			}
 		}
 	}
+}
+
+async fn add_peer(state: &AppState, peer_key: PeerKey, peer: Peer) {
+	let mut rooms: state.rooms.lock().await;
+	rooms.insert(peer_key, peer);
 }
