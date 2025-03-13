@@ -1,6 +1,10 @@
 use std::{
-	collections::HashMap,
-	sync::Arc
+	collections::{
+		HashMap,
+		HashSet,
+	},
+	sync::Arc,
+	net::SocketAddr
 };
 use axum::{
 	extract::{
@@ -12,13 +16,19 @@ use axum::{
 	routing::get,
 	Router,
 };
-use futures::StreamExt;
-use std::net::SocketAddr;
+use futures::{
+	StreamExt,
+	SinkExt
+};
 use tokio::{
 	net::TcpListener,
 	sync::{
-		mpsc::Sender,
-		Mutex
+		mpsc::{
+			Sender,
+			channel,
+		},
+		Mutex,
+		oneshot,
 	}
 };
 use serde::{ Deserialize, Serialize };
@@ -71,15 +81,72 @@ async fn ws_handler(
 	ws.on_upgrade(move |socket| handle_socket(socket, addr))
 }
 
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
+async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) {
 	println!("{who} connected.");
 
-	while let Some(Ok(msg)) = socket.next().await {
-		if let Message::Text(text) = msg {
-			if socket.send(Message::Text(text)).await.is_err() {
-				break;
+	let (mut sender, mut receiver) = socket.split();
+	let (tx, mut rx) = channel::<Message>(128);
+	let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+	let mut joined_rooms: HashSet<Room> = HashSet::new();
+
+	let recv_task = tokio::spawn(async move {
+		while let Some(msg) = receiver.next().await {
+			let msg = match msg {
+				Ok(msg) => msg,
+				Err(e) => {
+					eprintln!("Error receiving message: {:?}", e);
+					break;
+				}
+			};
+
+			let msg = match msg {
+				Message::Text(text) => text,
+				_ => continue,
+			};
+
+			let payload: MessagePayload = match serde_json::from_str(&msg) {
+				Ok(payload) => payload,
+				Err(e) => {
+					eprintln!("Error parsing message: {:?}", e);
+					continue;
+				}
+			};
+		}
+
+		for room in joined_rooms {
+			remove_peer(&state, (room, who)).await;
+		}
+
+		let _ = cancel_tx.send(());
+	});
+
+	let send_task = tokio::spawn(async move {
+		loop {
+			tokio::select! {
+				Some(msg) = rx.recv() => {
+					if let Err(e) = sender.send(msg).await {
+						eprintln!("Error sending message: {:?}", e);
+						break;
+					}
+					_ = &mut cancel_rx => {
+						break;
+					}
+				}
+			}
+		}
+	});
+
+	tokio::select! {
+		res = send_task => {
+			if let Err(e) = res {
+				eprintln!("Send task panicked: {:?}", e);
+			}
+		}
+
+		res = recv_task => {
+			if let Err(e) = res {
+				eprintln!("Receive task panicked: {:?}", e);
 			}
 		}
 	}
 }
-
