@@ -9,7 +9,7 @@ use std::{
 use axum::{
 	extract::{
 		ws::{ Message, WebSocket, WebSocketUpgrade },
-		connect_info::ConnectInconnect_info::ConnectInfofo,
+		connect_info::ConnectInfo,
 		State,
 	},
 	response::IntoResponse,
@@ -39,7 +39,7 @@ type PeerKey = (Room, SocketAddr);
 
 #[derive(Clone)]
 struct AppState {
-	rooms: Arc<Mutex<HashMap<PeerKey, Peer>>>;
+	rooms: Arc<Mutex<HashMap<PeerKey, Peer>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,17 +113,24 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
 			};
 	
 			match payload {
-				MessagePayload::Join { room } => {
-					add_peer(&state, (room.clone(), who), tx_clone()).await;
-					joined_rooms.insert(room.clone());
-					println!("{who} joined room {room}");
+				MessagePayload::Join { rooms } => {
+					add_peer(&state, (rooms.clone(), who), tx_clone()).await;
+					joined_rooms.insert(rooms.clone());
+					println!("{who} joined room {rooms}");
 				},
-				MessagePayload::Leave { room } => {
-					remove_peer(&state, (room.clone(), who)).await;
-					joined_rooms.remove(&room);
-					println!("{who} left room {room}");
+				MessagePayload::Leave { rooms } => {
+					remove_peer(&state, (rooms.clone(), who)).await;
+					joined_rooms.remove(&rooms);
+					println!("{who} left room {rooms}");
 				},
-				_ => (),
+				MessagePayload::Broadcast { rooms } => {
+					if !joined_rooms.contains(&rooms) {
+						eprintln!("{who} is not in room {rooms}");
+						continue;
+					}
+					broadcast_message(&state, &room, &message).await;
+					println!("{who} broadcasted: {message} in {rooms}")
+				}
 			}
 		}
 
@@ -142,7 +149,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
 						eprintln!("Error sending message: {:?}", e);
 						break;
 					}
-					_ = &mut cancel_rx => {
+					_ = &mut cancel_rx >> {
 						break;
 					}
 				}
@@ -166,11 +173,34 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
 }
 
 async fn add_peer(state: &AppState, peer_key: PeerKey, peer: Peer) {
-	let mut rooms: state.rooms.lock().await;
+	let mut rooms = state.rooms.lock().await;
 	rooms.insert(peer_key, peer);
 }
 
 async fn remove_peer(state: &AppState, peer_key: PeerKey) {
 	let mut rooms = state.rooms.lock().await;
 	rooms.remove(&peer_key);
+}
+
+async fn get_peers(state: &AppState, room: &str) -> Vec<Peer> {
+	let rooms = state.rooms.lock().await;
+	rooms
+		.iter()
+		.filter_map(|(key, peer)| {
+			if key.0 == room {
+				Some(peer.clone())
+			} else {
+				None
+			}
+		})
+		.collect()
+}
+
+async fn broadcast_message(state: AppState, room: &str, msg: &str) {
+	let peers = get_peers(state, room).await;
+	for peer in peers {
+		if let Err(e) = peer.send(Message::Text(msg.to_string())).await {
+			eprintln!("Error sending message to peer: {:?}", e);
+		}
+	}
 }
